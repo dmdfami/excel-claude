@@ -32,6 +32,13 @@ const KEY_FILE   = path.join(CFG_DIR, 'cert.key');
 const PLIST_FILE = path.join(HOME, 'Library', 'LaunchAgents', 'com.cowork-gateway.plist');
 const LOG_FILE   = '/tmp/cowork-gateway.log';
 const LABEL      = 'com.cowork-gateway';
+const ADDIN_SRC  = path.join(__dirname, 'addin');
+const WEF_DIR    = path.join(HOME, 'Library', 'Containers', 'com.microsoft.Excel',
+                             'Data', 'Documents', 'wef');
+// 1x1 transparent PNG — placeholder for ribbon icons (Excel accepts any PNG).
+const ICON_PNG = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
+    'base64');
 
 const c = {
     cyan:   (s) => `\x1b[36m${s}\x1b[0m`,
@@ -150,9 +157,52 @@ async function cmdInit() {
     writePlist();
     reloadLaunchd();
 
+    if (!args.includes('--no-addin')) {
+        installAddin(config);
+    }
+
     await sleep(2000);
     smokeTest(config);
     printExcelInstructions(config);
+}
+
+// ---------- Excel sideload add-in ----------
+function installAddin(cfg) {
+    const tplPath = path.join(ADDIN_SRC, 'manifest-template.xml');
+    if (!fs.existsSync(tplPath)) {
+        log(c.yellow('addin/manifest-template.xml not found — skipping add-in install'));
+        return;
+    }
+    fs.mkdirSync(WEF_DIR, { recursive: true });
+
+    // Stable per-machine GUID so re-running init updates the same add-in
+    // instead of registering a fresh one each time.
+    const guidFile = path.join(CFG_DIR, 'addin-guid');
+    let guid;
+    if (fs.existsSync(guidFile)) {
+        guid = fs.readFileSync(guidFile, 'utf8').trim();
+    } else {
+        guid = randomGuid();
+        fs.writeFileSync(guidFile, guid);
+    }
+
+    const xml = fs.readFileSync(tplPath, 'utf8')
+        .replace(/__PORT__/g, String(cfg.httpsPort))
+        .replace(/__GUID__/g, guid);
+
+    const dest = path.join(WEF_DIR, 'cowork-gateway-addin.xml');
+    fs.writeFileSync(dest, xml);
+    log(`Add-in manifest installed: ${dest}`);
+    log(c.dim('  Restart Excel → Insert → My Add-ins → Shared Folder → "Claude (cowork)"'));
+}
+
+function randomGuid() {
+    // RFC 4122 v4 GUID using crypto.randomBytes
+    const b = require('crypto').randomBytes(16);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    const hex = b.toString('hex');
+    return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20,32)}`;
 }
 
 // ---------- cert ----------
@@ -237,6 +287,11 @@ function cmdServe() {
         cert: fs.readFileSync(CERT_FILE),
         key:  fs.readFileSync(KEY_FILE),
     }, (clientReq, clientRes) => {
+        // Static add-in assets (taskpane HTML + icons) served from the
+        // package dir so Excel can load the sideloaded add-in over HTTPS.
+        if (clientReq.url.startsWith('/addin/')) {
+            return serveAddinAsset(clientReq, clientRes);
+        }
         // Forward to upstream
         const upstreamPath = (upstream.pathname.replace(/\/$/, '') + clientReq.url).replace(/\/+/g, '/');
         const opts = {
@@ -291,6 +346,25 @@ function cmdServe() {
     });
 }
 
+function serveAddinAsset(req, res) {
+    // Whitelist: taskpane.html and icon-*.png. Path traversal blocked
+    // by basename check.
+    const file = path.basename(req.url.split('?')[0]);
+    if (file === 'taskpane.html') {
+        const p = path.join(ADDIN_SRC, 'taskpane.html');
+        if (fs.existsSync(p)) {
+            res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+            return res.end(fs.readFileSync(p));
+        }
+    }
+    if (/^icon-(16|32|80)\.png$/.test(file)) {
+        res.writeHead(200, { 'content-type': 'image/png' });
+        return res.end(ICON_PNG);
+    }
+    res.writeHead(404);
+    res.end('not found');
+}
+
 // ---------- start/stop/status/uninstall ----------
 function cmdStart()  { sh('launchctl', ['load', PLIST_FILE], { allowFail: true }); log('started'); }
 function cmdStop()   { sh('launchctl', ['unload', PLIST_FILE], { allowFail: true }); log('stopped'); }
@@ -305,7 +379,8 @@ function cmdStatus() {
 }
 function cmdUninstall() {
     sh('launchctl', ['unload', PLIST_FILE], { allowFail: true });
-    [PLIST_FILE, CERT_FILE, KEY_FILE, CFG_FILE].forEach((f) => {
+    [PLIST_FILE, CERT_FILE, KEY_FILE, CFG_FILE,
+     path.join(WEF_DIR, 'cowork-gateway-addin.xml')].forEach((f) => {
         if (fs.existsSync(f)) fs.unlinkSync(f);
     });
     sh('security', ['delete-certificate', '-c', '127.0.0.1',
@@ -329,15 +404,21 @@ function smokeTest(cfg) {
 
 function printExcelInstructions(cfg) {
     const endpoint = `https://127.0.0.1:${cfg.httpsPort}/v1`;
+    const addinInstalled = fs.existsSync(path.join(WEF_DIR, 'cowork-gateway-addin.xml'));
     console.log(`
 ${c.green('✓ Setup complete.')}
 
-${c.cyan('Claude for Office (Excel) — Settings → Configure Gateway:')}
+${c.cyan('Sideloaded Excel add-in:')}
+  ${addinInstalled ? c.green('✓ installed at ' + WEF_DIR) : c.yellow('not installed (--no-addin was passed)')}
+  ${addinInstalled ? c.dim('→ Restart Excel → Insert → My Add-ins → Shared Folder → "Claude (cowork)"') : ''}
+  ${addinInstalled ? c.dim('  This bypasses tenant App-Catalog block (developer sideload).') : ''}
+
+${c.cyan('OR — official Claude for Office add-in (if your tenant allows it):')}
   ${c.dim('URL:')}        ${endpoint}
   ${c.dim('Token:')}      ${cfg.apiKey}
   ${c.dim('AuthHeader:')} x-api-key
   ${c.dim('APIFormat:')}  anthropic
-  ${c.dim('Model:')}      ${cfg.models[0]}  ${c.dim(`(or any of: ${cfg.models.join(', ')})`)}
+  ${c.dim('Model:')}      ${cfg.models[0]}
 
 ${c.cyan('Claude Desktop 3p — Configure third-party inference → Gateway:')}
   ${c.dim('Base URL:')}     ${endpoint}
@@ -358,17 +439,20 @@ const handlers = {
 if (handlers[cmd]) {
     Promise.resolve(handlers[cmd]()).catch((e) => die(e.message));
 } else {
-    console.log(`cowork-gateway — Anthropic-compatible HTTPS bridge for Excel & Claude Desktop
+    console.log(`cowork-gateway — Anthropic-compatible HTTPS bridge + sideload Excel add-in
 
 Commands:
-  init [--auto] [--port=N]
+  init [--auto] [--port=N] [--no-addin]
               Setup. Auto-detects 9router from ~/.9router/db.json.
-              --auto: zero-prompt mode using detected config + defaults.
+              Also sideloads an Excel add-in into wef/ folder, which
+              bypasses tenant App-Catalog restrictions (developer mode).
+              --auto:      zero-prompt mode using detected config.
+              --no-addin:  skip Excel add-in install.
   start       Load launchd service
   stop        Unload launchd service
   status      Show service + recent log
-  uninstall   Remove plist, cert, trust entry
-  serve       (internal) Run the HTTPS proxy in foreground
+  uninstall   Remove plist, cert, trust entry, sideloaded add-in
+  serve       (internal) Run the HTTPS proxy + add-in static host
 
 Quick start (with 9router already running locally):
   npx github:dmdfami/cowork-gateway init --auto

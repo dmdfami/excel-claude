@@ -41,9 +41,28 @@ Either way, the tool will:
 - Generate a self-signed cert for `127.0.0.1`
 - Trust it in your login keychain
 - Write a launchd plist so the proxy auto-starts at login
+- **Sideload an Excel add-in** into `~/Library/Containers/com.microsoft.Excel/Data/Documents/wef/` so you get a "Claude (cowork)" task pane in Excel — no need for the official Claude for Office add-in or any tenant-approved catalog
 - Print the exact settings to paste into Excel and Claude Desktop
 
 No Caddy, no nginx, no extra services — single Node process, native HTTPS.
+
+## Why a sideloaded add-in?
+
+If you sign into Excel with a corporate / tenant Microsoft account whose
+admin has disabled add-ins from the App Store and Centralized Deployment,
+the official "Claude for Office" add-in will refuse to load.
+
+Microsoft's **developer sideload mechanism** (the `wef/` folder) is a
+separate code path that tenant policy typically can't reach (it's
+file-system-local, not server-managed). Drop a manifest XML into that
+folder and Excel will pick it up under **Insert → My Add-ins → Shared
+Folder** regardless of tenant catalog settings.
+
+`cowork-gateway init` writes the manifest for you. The add-in itself
+is a tiny chat task pane that talks back to the local gateway — same
+machine, same HTTPS port, same self-trusted cert.
+
+Pass `--no-addin` if you only want the gateway and not the task pane.
 
 ## Use in Excel
 
