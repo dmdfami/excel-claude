@@ -1,131 +1,77 @@
 # cowork-gateway
 
-Run **Claude for Office (Excel)** and **Claude Desktop 3p** against any
-Anthropic-compatible gateway — 9router, litellm, openrouter — without
-fighting the three quirks that block this setup out of the box.
+Tiny **read-only diagnostic** that prints the right Excel / Claude
+Desktop config for talking to your local **9router** through whatever
+HTTPS proxy you have running (Caddy, mitmproxy, anything).
 
-## What it solves
+Replaces the manual "what port is the proxy on this time, what's my
+9router API key again?" lookup. Scans, prints, done.
 
-| Problem | Fix |
-|---|---|
-| Office add-ins refuse plain HTTP (mixed content) | Single-process Node HTTPS server with locally-trusted self-signed cert |
-| Excel only accepts model names matching `claude*` | Wizard step where you pick exactly which `claude-*` aliases to expose |
-| 9router's Windsurf-emulating `cc/` provider mangles tool names with `_ide` suffix → `UnknownToolError` | Streaming response rewrite strips the suffix transparently |
-
-## Install
-
-**One-liner — zero prompts** (when 9router is already running locally):
+## Usage
 
 ```bash
-npx github:dmdfami/cowork-gateway init --auto
+npx github:dmdfami/cowork-gateway
 ```
 
-The CLI reads `~/.9router/db.json`, pulls the API key, verifies the gateway
-is reachable on `:20128`, picks sensible default model aliases, and configures
-everything end-to-end.
+Output:
 
-**Interactive mode** (no 9router on this machine, or different gateway):
+```
+=== Local gateway scan ===
+  ✓ 9router      :20128  (http, reachable)
+  ✓ HTTPS proxy  :20443  (caddy pid=89752)
+
+=== Excel paste-ready config ===
+
+  Cấu hình Anthropic Claude extension trong Excel
+  ================================================
+
+  Gateway URL:   https://127.0.0.1:20443/v1
+  Token:         sk-...
+  Auth header:   x-api-key
+  API format:    anthropic
+  Model:         cc/claude-sonnet-4-6
+```
+
+## Save to file
 
 ```bash
-npx github:dmdfami/cowork-gateway init
+npx github:dmdfami/cowork-gateway --save
 ```
 
-Prompts for:
+Writes the config block to `~/Desktop/excel-claude-config.txt` so you
+can copy-paste it into Excel later without remembering port numbers.
 
-1. **Gateway base URL** — e.g. `http://127.0.0.1:20128/v1`
-2. **API key** — the `sk-...` token
-3. **Model IDs** — comma-separated, e.g. `claude-sonnet-4-6,claude-opus-4-7`
-
-Either way, the tool will:
-
-- Generate a self-signed cert for `127.0.0.1`
-- Trust it in your login keychain
-- Write a launchd plist so the proxy auto-starts at login
-- **Sideload an Excel add-in** into `~/Library/Containers/com.microsoft.Excel/Data/Documents/wef/` so you get a "Claude (cowork)" task pane in Excel — no need for the official Claude for Office add-in or any tenant-approved catalog
-- Print the exact settings to paste into Excel and Claude Desktop
-
-No Caddy, no nginx, no extra services — single Node process, native HTTPS.
-
-## Why a sideloaded add-in?
-
-If you sign into Excel with a corporate / tenant Microsoft account whose
-admin has disabled add-ins from the App Store and Centralized Deployment,
-the official "Claude for Office" add-in will refuse to load.
-
-Microsoft's **developer sideload mechanism** (the `wef/` folder) is a
-separate code path that tenant policy typically can't reach (it's
-file-system-local, not server-managed). Drop a manifest XML into that
-folder and Excel will pick it up under **Insert → My Add-ins → Shared
-Folder** regardless of tenant catalog settings.
-
-`cowork-gateway init` writes the manifest for you. The add-in itself
-is a tiny chat task pane that talks back to the local gateway — same
-machine, same HTTPS port, same self-trusted cert.
-
-Pass `--no-addin` if you only want the gateway and not the task pane.
-
-## Use in Excel
-
-After `init`, open **Claude for Office** → Settings → Configure Gateway:
-
-```
-URL:        https://127.0.0.1:20443/v1
-Token:      sk-...
-AuthHeader: x-api-key
-APIFormat:  anthropic
-Model:      claude-sonnet-4-6
-```
-
-Apply, restart Excel, ask Claude to build a spreadsheet — tools work.
-
-## Use in Claude Desktop 3p
-
-Settings → Configure third-party inference → Gateway:
-
-```
-Base URL:     https://127.0.0.1:20443/v1
-API key:      sk-...
-Auth scheme:  bearer
-```
-
-## Manage
+## JSON mode (for scripts)
 
 ```bash
-cowork-gateway start
-cowork-gateway stop
-cowork-gateway status
-cowork-gateway uninstall
+npx github:dmdfami/cowork-gateway --json
 ```
 
-Logs at `/tmp/cowork-gateway.log`.
+Returns `{nineRouter, httpsProxy, apiKey, models}` for programmatic use.
 
-## Architecture
+## What this tool does NOT do
 
-```
-Excel ──HTTPS──▶  cowork-gateway (Node, :20443)  ──HTTP──▶  upstream gateway
-                  ↳ self-signed TLS termination
-                  ↳ strips `_ide` suffix from tool_use names in response stream
-```
+- Does **not** install services, certs, or launchd plists.
+- Does **not** modify Excel preferences or sideload add-ins.
+- Does **not** start 9router or Caddy.
+- Does **not** touch `~/.9router/db.json` (read-only).
 
-Single Node process, zero npm dependencies, ~300 LOC.
+It only reads and reports. Use your existing setup scripts (or set up
+Caddy manually) to get an HTTPS proxy running. This tool will then
+discover and print the config.
 
-## Why does `_ide` get added in the first place?
+## Why?
 
-9router's `cc/` provider authenticates against Anthropic by impersonating
-the Cascade/Windsurf IDE. Cascade has a fixed whitelist of 20 tool names
-(`view_file`, `run_command`, etc.); any tool not on the list gets `_ide`
-appended outbound so upstream auth accepts it. 9router never reverses the
-mangle on the response, so clients see `foo_ide` and reject it. This
-gateway un-mangles the response so Excel/Claude Desktop see the original
-`foo` they sent.
+Port numbers, API keys, and which proxy is in front of 9router this
+session are easy to forget. Excel re-prompts for the gateway URL more
+often than you'd like. This tool removes the "look up the values" step
+to a one-liner you can run from any terminal.
 
 ## Compatibility
 
-- macOS 12+ (Apple Silicon or Intel)
-- Node 18+
-- System `openssl` (preinstalled on macOS)
-
-Linux/Windows support — PRs welcome.
+- macOS (uses `lsof` to scan listeners)
+- Node 18+ (uses native `https.request` only — zero npm deps)
+- Assumes 9router is installed at `~/.9router/`
 
 ## License
 

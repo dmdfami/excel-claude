@@ -1,19 +1,20 @@
 #!/usr/bin/env node
 /*
- * cowork-gateway — HTTPS bridge that lets Claude for Office (Excel) and
- * Claude Desktop 3p talk to any Anthropic-compatible gateway (9router,
- * litellm, etc.). Solves three concrete pains:
+ * cowork-gateway — read-only diagnostic / config printer.
  *
- *   1. Office add-ins block plain HTTP (mixed content) → we serve HTTPS
- *      with a locally-trusted self-signed cert.
- *   2. Excel rejects model names that don't match `claude*` → use the
- *      "model" wizard step to expose only safe aliases.
- *   3. 9router's Windsurf-emulating provider (`cc/`) appends `_ide` to
- *      tool names; we strip the suffix on the way back so clients see
- *      the original names.
+ * Scans the local machine for:
+ *   1. 9router (~/.9router/db.json + listener on :20128)
+ *   2. An HTTPS proxy in front of 9router (typically :20443) that
+ *      successfully forwards /v1/models with the 9router API key.
  *
- * Zero npm dependencies — relies on Node 18+ stdlib, system openssl,
- * and macOS `security`/`launchctl`.
+ * Emits an Excel-paste-ready config block. Does NOT install services,
+ * does NOT generate certs, does NOT touch Excel preferences. Pure read.
+ *
+ * Run: npx github:dmdfami/cowork-gateway
+ *
+ * Flags:
+ *   --save   Also write config to ~/Desktop/excel-claude-config.txt
+ *   --json   Emit machine-readable JSON instead of human output
  */
 
 const fs        = require('fs');
@@ -21,24 +22,11 @@ const os        = require('os');
 const path      = require('path');
 const http      = require('http');
 const https     = require('https');
-const readline  = require('readline');
 const { spawnSync } = require('child_process');
 
-const HOME       = os.homedir();
-const CFG_DIR    = path.join(HOME, '.config', 'cowork-gateway');
-const CFG_FILE   = path.join(CFG_DIR, 'config.json');
-const CERT_FILE  = path.join(CFG_DIR, 'cert.crt');
-const KEY_FILE   = path.join(CFG_DIR, 'cert.key');
-const PLIST_FILE = path.join(HOME, 'Library', 'LaunchAgents', 'com.cowork-gateway.plist');
-const LOG_FILE   = '/tmp/cowork-gateway.log';
-const LABEL      = 'com.cowork-gateway';
-const ADDIN_SRC  = path.join(__dirname, 'addin');
-const WEF_DIR    = path.join(HOME, 'Library', 'Containers', 'com.microsoft.Excel',
-                             'Data', 'Documents', 'wef');
-// 1x1 transparent PNG — placeholder for ribbon icons (Excel accepts any PNG).
-const ICON_PNG = Buffer.from(
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
-    'base64');
+const HOME = os.homedir();
+const NINER_DB = path.join(HOME, '.9router', 'db.json');
+const SAVE_PATH = path.join(HOME, 'Desktop', 'excel-claude-config.txt');
 
 const c = {
     cyan:   (s) => `\x1b[36m${s}\x1b[0m`,
@@ -46,418 +34,160 @@ const c = {
     yellow: (s) => `\x1b[33m${s}\x1b[0m`,
     red:    (s) => `\x1b[31m${s}\x1b[0m`,
     dim:    (s) => `\x1b[2m${s}\x1b[0m`,
+    bold:   (s) => `\x1b[1m${s}\x1b[0m`,
 };
 
-const log  = (...a) => console.log(c.cyan('[cowork]'), ...a);
-const die  = (m) => { console.error(c.red('[cowork] ERROR:'), m); process.exit(1); };
-
-const sh = (cmd, args, opts = {}) => {
-    const r = spawnSync(cmd, args, { encoding: 'utf8', ...opts });
-    if (r.status !== 0 && !opts.allowFail) {
-        throw new Error(`${cmd} ${args.join(' ')} failed: ${r.stderr || r.stdout}`);
-    }
-    return r;
-};
-
-// ---------- prompt helpers ----------
-const ask = (question, defaultValue = '') => new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    const prompt = defaultValue
-        ? `${question} ${c.dim(`[${defaultValue}]`)} `
-        : `${question} `;
-    rl.question(prompt, (answer) => {
-        rl.close();
-        resolve((answer.trim() || defaultValue).trim());
+function probe({ host, port, scheme, path: p, apiKey, timeout = 3000 }) {
+    return new Promise((resolve) => {
+        const lib = scheme === 'https' ? https : http;
+        const req = lib.request({
+            host, port, path: p, method: 'GET',
+            headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+            rejectUnauthorized: false,
+            timeout,
+        }, (res) => {
+            let body = '';
+            res.on('data', (d) => { body += d.toString(); if (body.length > 4096) body = body.slice(0, 4096); });
+            res.on('end', () => resolve({ ok: res.statusCode === 200, status: res.statusCode, body }));
+        });
+        req.on('error', (e) => resolve({ ok: false, error: e.message }));
+        req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
+        req.end();
     });
-});
+}
 
-// ---------- detect ----------
-const DEFAULT_MODELS = ['claude-sonnet-4-6', 'claude-opus-4-7', 'claude-haiku-4-5'];
+function listListeners(portRange) {
+    const r = spawnSync('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN'], { encoding: 'utf8' });
+    if (r.status !== 0) return [];
+    const lines = r.stdout.split('\n').slice(1).filter(Boolean);
+    const out = [];
+    for (const line of lines) {
+        const cols = line.split(/\s+/);
+        const cmd  = cols[0];
+        const pid  = cols[1];
+        const name = cols[cols.length - 2] || cols[cols.length - 1];
+        const m = name.match(/:(\d+)$/);
+        if (!m) continue;
+        const port = Number(m[1]);
+        if (port >= portRange[0] && port <= portRange[1]) {
+            out.push({ cmd, pid: Number(pid), port });
+        }
+    }
+    return out;
+}
 
-// Look for an existing 9router install on the local machine and pull its
-// baseUrl + first apiKey straight from db.json. Verifies the gateway is
-// actually reachable before returning. Returns null if nothing usable.
-function detectLocal9router() {
-    const dbPath = path.join(HOME, '.9router', 'db.json');
-    if (!fs.existsSync(dbPath)) return null;
+async function findHttpsProxy(apiKey) {
+    // Common Caddy / cowork-gateway / mitmproxy ports first, then scan 20440-20460.
+    const candidates = [20443, 20444, 20445, 20446, 20447, 20448, 20449, 20450];
+    const listeners = listListeners([20440, 20460]);
+    for (const l of listeners) {
+        if (!candidates.includes(l.port)) candidates.push(l.port);
+    }
+    for (const port of [...new Set(candidates)]) {
+        const r = await probe({ host: '127.0.0.1', port, scheme: 'https', path: '/v1/models', apiKey });
+        if (r.ok) return { port, listener: listeners.find((l) => l.port === port) };
+    }
+    return null;
+}
+
+async function scan() {
+    if (!fs.existsSync(NINER_DB)) {
+        return { error: '9router not installed (~/.9router/db.json missing). Install with: npm install -g 9router' };
+    }
     let db;
-    try { db = JSON.parse(fs.readFileSync(dbPath, 'utf8')); }
-    catch (_) { return null; }
+    try { db = JSON.parse(fs.readFileSync(NINER_DB, 'utf8')); }
+    catch (e) { return { error: '9router db.json unreadable: ' + e.message }; }
     const apiKey = db?.apiKeys?.[0]?.key;
-    if (!apiKey) return null;
-    const baseUrl = 'http://127.0.0.1:20128/v1';
-    const r = sh('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}',
-        '--max-time', '3', `${baseUrl}/models`,
-        '-H', `Authorization: Bearer ${apiKey}`], { allowFail: true });
-    if (r.stdout.trim() !== '200') return null;
-    return { baseUrl, apiKey, source: '~/.9router/db.json' };
+    if (!apiKey) return { error: '9router has no apiKey. Open dashboard http://127.0.0.1:20128/dashboard' };
+
+    const niner   = await probe({ host: '127.0.0.1', port: 20128, scheme: 'http',  path: '/v1/models', apiKey });
+    const httpsP  = await findHttpsProxy(apiKey);
+
+    return {
+        nineRouter: { port: 20128, alive: niner.ok, status: niner.status || niner.error },
+        httpsProxy: httpsP
+            ? { port: httpsP.port, listener: httpsP.listener, alive: true }
+            : { alive: false, hint: 'No HTTPS proxy reaching 9router. Excel/Office add-ins need HTTPS — start your Caddy/cowork proxy first.' },
+        apiKey,
+        models: ['cc/claude-sonnet-4-6', 'cc/claude-opus-4-7', 'cc/claude-haiku-4-5-20251001'],
+    };
 }
 
-function checkPortFree(port) {
-    const r = sh('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN'],
-                 { allowFail: true });
-    if (r.stdout.trim()) {
-        die(`Port ${port} already in use:\n${r.stdout}\nStop the existing service or re-run init with a different port.`);
+function buildConfigText(s) {
+    if (!s.httpsProxy?.alive) return null;
+    const url = `https://127.0.0.1:${s.httpsProxy.port}/v1`;
+    return `Cấu hình Anthropic Claude extension trong Excel
+================================================
+
+Gateway URL:   ${url}
+Token:         ${s.apiKey}
+Auth header:   x-api-key
+API format:    anthropic
+Model:         ${s.models[0]}
+
+Other models you can pick:
+  ${s.models.slice(1).join('\n  ')}
+
+(Port ${s.httpsProxy.port} = HTTPS proxy in front of 9router :${s.nineRouter.port};
+Excel add-ins reject plain HTTP, that's why we don't use :${s.nineRouter.port} directly.)
+`;
+}
+
+function printHuman(s) {
+    if (s.error) {
+        console.error(c.red('✗ ' + s.error));
+        process.exit(1);
+    }
+    console.log(c.bold('=== Local gateway scan ==='));
+    const ok9   = s.nineRouter.alive;
+    const okHt  = s.httpsProxy.alive;
+    console.log(`  ${ok9  ? c.green('✓') : c.red('✗')} 9router      :${s.nineRouter.port}  ${c.dim(`(http, ${ok9  ? 'reachable' : s.nineRouter.status})`)}`);
+    if (okHt) {
+        const l = s.httpsProxy.listener;
+        const desc = l ? `${l.cmd} pid=${l.pid}` : 'unknown';
+        console.log(`  ${c.green('✓')} HTTPS proxy  :${s.httpsProxy.port}  ${c.dim(`(${desc})`)}`);
+    } else {
+        console.log(`  ${c.red('✗')} HTTPS proxy   ${c.dim(s.httpsProxy.hint)}`);
+    }
+    console.log();
+
+    const cfg = buildConfigText(s);
+    if (cfg) {
+        console.log(c.bold('=== Excel paste-ready config ==='));
+        console.log();
+        console.log(cfg.split('\n').map((l) => '  ' + l).join('\n'));
+        console.log();
+        console.log(c.dim('Save to file: cowork-gateway --save'));
+        console.log(c.dim('Re-run anytime to re-emit if you forget the values.'));
+    } else {
+        console.log(c.yellow('Cannot emit config — HTTPS proxy not reachable.'));
+        console.log(c.dim('Set up Caddy or another HTTPS proxy in front of 9router :' + s.nineRouter.port));
+        process.exit(2);
     }
 }
 
-// ---------- init ----------
-async function cmdInit() {
-    const args = process.argv.slice(3);
-    const auto = args.includes('--auto') || args.includes('-y') || args.includes('--yes');
-    const portArg = args.find((a) => a.startsWith('--port='));
-    const portFromArg = portArg ? Number(portArg.split('=')[1]) : null;
+(async () => {
+    const args = process.argv.slice(2);
+    const wantJson = args.includes('--json');
+    const wantSave = args.includes('--save');
 
-    let baseUrl, apiKey, models, httpsPort;
+    const s = await scan();
 
-    const detected = detectLocal9router();
-    if (detected) {
-        log(`${c.green('✓')} Detected 9router → ${detected.baseUrl}`);
-        log(`  API key from ${detected.source}`);
-        if (auto) {
-            log(`Running ${c.cyan('--auto')} mode — using detected config, no prompts.`);
-            ({ baseUrl, apiKey } = detected);
-            models = DEFAULT_MODELS;
-            httpsPort = portFromArg || 20443;
-        } else {
-            const confirm = await ask(`Use detected config? ${c.dim('[Y/n]')}`, 'Y');
-            if (confirm.toLowerCase().startsWith('y')) {
-                ({ baseUrl, apiKey } = detected);
-                const modelStr = await ask('Model IDs (comma-sep):',
-                                            DEFAULT_MODELS.join(','));
-                models = modelStr.split(',').map((s) => s.trim()).filter(Boolean);
-                httpsPort = portFromArg || Number(await ask('HTTPS port:', '20443'));
-            }
-        }
-    }
-
-    // Wizard fallback (no detection or user declined)
-    if (!apiKey) {
-        if (auto) die('No 9router detected and --auto specified. Run without --auto for wizard.');
-        log('No local 9router detected, or you declined. Manual setup:\n');
-        baseUrl  = await ask('1. Gateway base URL:', 'http://127.0.0.1:20128/v1');
-        apiKey   = await ask('2. API key (sk-...):');
-        const modelStr = await ask('3. Model IDs (comma-sep):',
-                                    DEFAULT_MODELS.join(','));
-        models = modelStr.split(',').map((s) => s.trim()).filter(Boolean);
-        httpsPort = portFromArg || Number(await ask('4. HTTPS port:', '20443'));
-    }
-
-    if (!baseUrl || !apiKey) die('baseUrl and apiKey are required');
-    checkPortFree(httpsPort);
-
-    const config = { baseUrl, apiKey, models, httpsPort, toolNameUnmangle: true };
-    fs.mkdirSync(CFG_DIR, { recursive: true });
-    fs.writeFileSync(CFG_FILE, JSON.stringify(config, null, 2));
-    fs.chmodSync(CFG_FILE, 0o600);
-    log(`Config saved: ${CFG_FILE}`);
-
-    generateCert();
-    trustCert();
-    writePlist();
-    reloadLaunchd();
-
-    if (!args.includes('--no-addin')) {
-        installAddin(config);
-    }
-
-    await sleep(2000);
-    smokeTest(config);
-    printExcelInstructions(config);
-}
-
-// ---------- Excel sideload add-in ----------
-function installAddin(cfg) {
-    const tplPath = path.join(ADDIN_SRC, 'manifest-template.xml');
-    if (!fs.existsSync(tplPath)) {
-        log(c.yellow('addin/manifest-template.xml not found — skipping add-in install'));
+    if (wantJson) {
+        console.log(JSON.stringify(s, null, 2));
         return;
     }
-    fs.mkdirSync(WEF_DIR, { recursive: true });
 
-    // Stable per-machine GUID so re-running init updates the same add-in
-    // instead of registering a fresh one each time.
-    const guidFile = path.join(CFG_DIR, 'addin-guid');
-    let guid;
-    if (fs.existsSync(guidFile)) {
-        guid = fs.readFileSync(guidFile, 'utf8').trim();
-    } else {
-        guid = randomGuid();
-        fs.writeFileSync(guidFile, guid);
-    }
+    printHuman(s);
 
-    const xml = fs.readFileSync(tplPath, 'utf8')
-        .replace(/__PORT__/g, String(cfg.httpsPort))
-        .replace(/__GUID__/g, guid);
-
-    const dest = path.join(WEF_DIR, 'cowork-gateway-addin.xml');
-    fs.writeFileSync(dest, xml);
-    log(`Add-in manifest installed: ${dest}`);
-    log(c.dim('  Restart Excel → Insert → My Add-ins → Shared Folder → "Claude (cowork)"'));
-}
-
-function randomGuid() {
-    // RFC 4122 v4 GUID using crypto.randomBytes
-    const b = require('crypto').randomBytes(16);
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    const hex = b.toString('hex');
-    return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20,32)}`;
-}
-
-// ---------- cert ----------
-function generateCert() {
-    if (fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE)) {
-        // Check expiry > 30 days
-        const r = sh('openssl', ['x509', '-in', CERT_FILE, '-noout', '-checkend', '2592000'],
-                     { allowFail: true });
-        if (r.status === 0) {
-            log('Cert OK (>30 days valid)');
-            return;
+    if (wantSave) {
+        const cfg = buildConfigText(s);
+        if (cfg) {
+            fs.writeFileSync(SAVE_PATH, cfg);
+            console.log(c.green(`\n✓ Saved to ${SAVE_PATH}`));
         }
     }
-    log('Generating self-signed cert for 127.0.0.1...');
-    const cnf = `[req]\ndistinguished_name=req\n[v3]\nsubjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:false`;
-    const cnfFile = path.join(CFG_DIR, 'openssl.cnf');
-    fs.writeFileSync(cnfFile, cnf);
-    sh('openssl', ['req', '-x509', '-nodes', '-newkey', 'rsa:2048',
-        '-keyout', KEY_FILE, '-out', CERT_FILE,
-        '-days', '825', '-subj', '/CN=127.0.0.1',
-        '-extensions', 'v3', '-config', cnfFile]);
-    fs.chmodSync(KEY_FILE, 0o600);
-    fs.unlinkSync(cnfFile);
-    log(`Cert: ${CERT_FILE}`);
-}
-
-function trustCert() {
-    // Check if already trusted in login keychain
-    const r = sh('security', ['find-certificate', '-c', '127.0.0.1',
-        path.join(HOME, 'Library/Keychains/login.keychain-db')], { allowFail: true });
-    if (r.status === 0) {
-        log('Cert already trusted in login keychain');
-        return;
-    }
-    log('Trusting cert in login keychain...');
-    sh('security', ['add-trusted-cert', '-r', 'trustRoot',
-        '-k', path.join(HOME, 'Library/Keychains/login.keychain-db'),
-        CERT_FILE]);
-}
-
-// ---------- launchd ----------
-function writePlist() {
-    const nodeBin = process.execPath;
-    const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>${LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${nodeBin}</string>
-    <string>${path.resolve(__filename)}</string>
-    <string>serve</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${LOG_FILE}</string>
-  <key>StandardErrorPath</key><string>${LOG_FILE}</string>
-</dict>
-</plist>`;
-    fs.mkdirSync(path.dirname(PLIST_FILE), { recursive: true });
-    fs.writeFileSync(PLIST_FILE, plist);
-    log(`launchd plist: ${PLIST_FILE}`);
-}
-
-function reloadLaunchd() {
-    sh('launchctl', ['unload', PLIST_FILE], { allowFail: true });
-    sh('launchctl', ['load', PLIST_FILE]);
-    log('Service loaded — auto-starts on login');
-}
-
-// ---------- serve (run by launchd) ----------
-function cmdServe() {
-    if (!fs.existsSync(CFG_FILE)) die('Not initialized — run `cowork-gateway init` first');
-    const cfg = JSON.parse(fs.readFileSync(CFG_FILE, 'utf8'));
-    const upstream = new URL(cfg.baseUrl);
-
-    const NAME_RE = /"name"(\s*:\s*)"([^"]*?)_ide"/g;
-    const stripIde = (s) => s.replace(NAME_RE, '"name"$1"$2"');
-
-    const server = https.createServer({
-        cert: fs.readFileSync(CERT_FILE),
-        key:  fs.readFileSync(KEY_FILE),
-    }, (clientReq, clientRes) => {
-        // Static add-in assets (taskpane HTML + icons) served from the
-        // package dir so Excel can load the sideloaded add-in over HTTPS.
-        if (clientReq.url.startsWith('/addin/')) {
-            return serveAddinAsset(clientReq, clientRes);
-        }
-        // Forward to upstream
-        const upstreamPath = (upstream.pathname.replace(/\/$/, '') + clientReq.url).replace(/\/+/g, '/');
-        const opts = {
-            host: upstream.hostname,
-            port: upstream.port || (upstream.protocol === 'https:' ? 443 : 80),
-            method: clientReq.method,
-            path: upstreamPath,
-            headers: { ...clientReq.headers, host: upstream.host },
-        };
-        const lib = upstream.protocol === 'https:' ? https : http;
-        const upstreamReq = lib.request(opts, (upstreamRes) => {
-            const headers = { ...upstreamRes.headers };
-            delete headers['content-length']; // body may shrink after rewrite
-            clientRes.writeHead(upstreamRes.statusCode, headers);
-
-            if (!cfg.toolNameUnmangle) {
-                upstreamRes.pipe(clientRes);
-                return;
-            }
-
-            let buf = '';
-            upstreamRes.setEncoding('utf8');
-            upstreamRes.on('data', (chunk) => {
-                buf += chunk;
-                const split = Math.max(buf.lastIndexOf('\n'), buf.lastIndexOf('}'));
-                if (split === -1) return;
-                clientRes.write(stripIde(buf.slice(0, split + 1)));
-                buf = buf.slice(split + 1);
-            });
-            upstreamRes.on('end', () => {
-                if (buf) clientRes.write(stripIde(buf));
-                clientRes.end();
-            });
-            upstreamRes.on('error', (err) => {
-                console.error('upstream error:', err.message);
-                clientRes.destroy();
-            });
-        });
-        upstreamReq.on('error', (err) => {
-            console.error('upstream connect error:', err.message);
-            try {
-                clientRes.writeHead(502, { 'content-type': 'text/plain' });
-                clientRes.end(`upstream unreachable: ${err.message}`);
-            } catch (_) {}
-        });
-        clientReq.pipe(upstreamReq);
-        clientReq.on('error', () => upstreamReq.destroy());
-    });
-
-    server.listen(cfg.httpsPort, '127.0.0.1', () => {
-        console.log(`[cowork-gateway] HTTPS https://127.0.0.1:${cfg.httpsPort} → ${cfg.baseUrl} (unmangle=${cfg.toolNameUnmangle})`);
-    });
-}
-
-function serveAddinAsset(req, res) {
-    // Whitelist: taskpane.html and icon-*.png. Path traversal blocked
-    // by basename check.
-    const file = path.basename(req.url.split('?')[0]);
-    if (file === 'taskpane.html') {
-        const p = path.join(ADDIN_SRC, 'taskpane.html');
-        if (fs.existsSync(p)) {
-            res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-            return res.end(fs.readFileSync(p));
-        }
-    }
-    if (/^icon-(16|32|80)\.png$/.test(file)) {
-        res.writeHead(200, { 'content-type': 'image/png' });
-        return res.end(ICON_PNG);
-    }
-    res.writeHead(404);
-    res.end('not found');
-}
-
-// ---------- start/stop/status/uninstall ----------
-function cmdStart()  { sh('launchctl', ['load', PLIST_FILE], { allowFail: true }); log('started'); }
-function cmdStop()   { sh('launchctl', ['unload', PLIST_FILE], { allowFail: true }); log('stopped'); }
-function cmdStatus() {
-    const r = sh('launchctl', ['list', LABEL], { allowFail: true });
-    console.log(r.stdout || c.yellow('not loaded'));
-    if (fs.existsSync(LOG_FILE)) {
-        console.log(c.dim('--- last log lines ---'));
-        const lines = fs.readFileSync(LOG_FILE, 'utf8').split('\n').slice(-5);
-        console.log(lines.join('\n'));
-    }
-}
-function cmdUninstall() {
-    sh('launchctl', ['unload', PLIST_FILE], { allowFail: true });
-    [PLIST_FILE, CERT_FILE, KEY_FILE, CFG_FILE,
-     path.join(WEF_DIR, 'cowork-gateway-addin.xml')].forEach((f) => {
-        if (fs.existsSync(f)) fs.unlinkSync(f);
-    });
-    sh('security', ['delete-certificate', '-c', '127.0.0.1',
-        path.join(HOME, 'Library/Keychains/login.keychain-db')], { allowFail: true });
-    log('uninstalled. Config dir kept at ' + CFG_DIR);
-}
-
-// ---------- helpers ----------
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function smokeTest(cfg) {
-    const url = `https://127.0.0.1:${cfg.httpsPort}/models`;
-    const r = sh('curl', ['-sk', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', '5',
-        url, '-H', `Authorization: Bearer ${cfg.apiKey}`], { allowFail: true });
-    if (r.stdout.trim() === '200') {
-        log(c.green('✓ smoke test passed — gateway reachable'));
-    } else {
-        console.log(c.yellow(`! smoke test inconclusive (HTTP ${r.stdout.trim() || '???'}). Check ${LOG_FILE}`));
-    }
-}
-
-function printExcelInstructions(cfg) {
-    const endpoint = `https://127.0.0.1:${cfg.httpsPort}/v1`;
-    const addinInstalled = fs.existsSync(path.join(WEF_DIR, 'cowork-gateway-addin.xml'));
-    console.log(`
-${c.green('✓ Setup complete.')}
-
-${c.cyan('Sideloaded Excel add-in:')}
-  ${addinInstalled ? c.green('✓ installed at ' + WEF_DIR) : c.yellow('not installed (--no-addin was passed)')}
-  ${addinInstalled ? c.dim('→ Restart Excel → Insert → My Add-ins → Shared Folder → "Claude (cowork)"') : ''}
-  ${addinInstalled ? c.dim('  This bypasses tenant App-Catalog block (developer sideload).') : ''}
-
-${c.cyan('OR — official Claude for Office add-in (if your tenant allows it):')}
-  ${c.dim('URL:')}        ${endpoint}
-  ${c.dim('Token:')}      ${cfg.apiKey}
-  ${c.dim('AuthHeader:')} x-api-key
-  ${c.dim('APIFormat:')}  anthropic
-  ${c.dim('Model:')}      ${cfg.models[0]}
-
-${c.cyan('Claude Desktop 3p — Configure third-party inference → Gateway:')}
-  ${c.dim('Base URL:')}     ${endpoint}
-  ${c.dim('API key:')}      ${cfg.apiKey}
-  ${c.dim('Auth scheme:')}  bearer
-
-${c.dim(`Logs: ${LOG_FILE}`)}
-${c.dim(`Manage: cowork-gateway [start|stop|status|uninstall]`)}
-`);
-}
-
-// ---------- entry ----------
-const cmd = process.argv[2] || 'help';
-const handlers = {
-    init: cmdInit, serve: cmdServe,
-    start: cmdStart, stop: cmdStop, status: cmdStatus, uninstall: cmdUninstall,
-};
-if (handlers[cmd]) {
-    Promise.resolve(handlers[cmd]()).catch((e) => die(e.message));
-} else {
-    console.log(`cowork-gateway — Anthropic-compatible HTTPS bridge + sideload Excel add-in
-
-Commands:
-  init [--auto] [--port=N] [--no-addin]
-              Setup. Auto-detects 9router from ~/.9router/db.json.
-              Also sideloads an Excel add-in into wef/ folder, which
-              bypasses tenant App-Catalog restrictions (developer mode).
-              --auto:      zero-prompt mode using detected config.
-              --no-addin:  skip Excel add-in install.
-  start       Load launchd service
-  stop        Unload launchd service
-  status      Show service + recent log
-  uninstall   Remove plist, cert, trust entry, sideloaded add-in
-  serve       (internal) Run the HTTPS proxy + add-in static host
-
-Quick start (with 9router already running locally):
-  npx github:dmdfami/cowork-gateway init --auto
-
-Manual mode (will prompt for baseUrl + apiKey):
-  npx github:dmdfami/cowork-gateway init
-`);
-}
+})().catch((e) => {
+    console.error(c.red('Unexpected error: ' + e.message));
+    process.exit(1);
+});
