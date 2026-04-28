@@ -1,0 +1,33 @@
+{
+  "name": "cowork-gateway",
+  "version": "0.1.0",
+  "description": "Run Claude for Office (Excel) and Claude Desktop 3p against any Anthropic-compatible gateway (e.g. 9router) — bundles HTTPS termination, self-signed cert, and tool-name un-mangling for Windsurf-style providers.",
+  "bin": {
+    "cowork-gateway": "./cli.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "cli.js",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node cli.js serve"
+  },
+  "keywords": [
+    "claude",
+    "anthropic",
+    "gateway",
+    "9router",
+    "excel",
+    "office-addin",
+    "claude-desktop"
+  ],
+  "author": "dmdfami",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dmdfami/cowork-gateway.git"
+  }
+}
