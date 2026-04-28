@@ -37,20 +37,23 @@ const c = {
     bold:   (s) => `\x1b[1m${s}\x1b[0m`,
 };
 
-function probe({ host, port, scheme, path: p, apiKey, timeout = 3000 }) {
+function probe({ host, port, scheme, path: p, apiKey, timeout = 3000, strictTls = false }) {
     return new Promise((resolve) => {
         const lib = scheme === 'https' ? https : http;
         const req = lib.request({
             host, port, path: p, method: 'GET',
             headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
-            rejectUnauthorized: false,
+            // strictTls=false: just confirm something answers (used for discovery)
+            // strictTls=true: also require cert to chain to a trusted root
+            //   (Excel/Claude WebView enforces this, our scan must too).
+            rejectUnauthorized: strictTls,
             timeout,
         }, (res) => {
             let body = '';
             res.on('data', (d) => { body += d.toString(); if (body.length > 4096) body = body.slice(0, 4096); });
             res.on('end', () => resolve({ ok: res.statusCode === 200, status: res.statusCode, body }));
         });
-        req.on('error', (e) => resolve({ ok: false, error: e.message }));
+        req.on('error', (e) => resolve({ ok: false, error: e.message, code: e.code }));
         req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
         req.end();
     });
@@ -76,16 +79,42 @@ function listListeners(portRange) {
     return out;
 }
 
+// Verify a cert is trusted by macOS keychain (matches what Excel/WebKit do).
+// Use system curl on macOS — it uses Apple Secure Transport, which reads the
+// keychain. Node's built-in TLS only knows its bundled CA list, so it would
+// reject self-signed-but-keychain-trusted certs and produce false negatives.
+function verifyCertViaSystemCurl(url, apiKey) {
+    const r = spawnSync('/usr/bin/curl',
+        ['-s', '-o', '/dev/null', '-w', '%{http_code}|%{ssl_verify_result}',
+         '--max-time', '5', url,
+         '-H', `Authorization: Bearer ${apiKey}`],
+        { encoding: 'utf8' });
+    if (r.status !== 0) return { trusted: false, error: r.stderr || 'curl error', http: null };
+    const [http, sslVerify] = (r.stdout || '').split('|');
+    // ssl_verify_result === '0' means the cert chain validated against the
+    // system trust store. Anything else (or empty) means Excel will reject.
+    return { trusted: http === '200' && sslVerify === '0', http, sslVerify };
+}
+
 async function findHttpsProxy(apiKey) {
-    // Common Caddy / cowork-gateway / mitmproxy ports first, then scan 20440-20460.
     const candidates = [20443, 20444, 20445, 20446, 20447, 20448, 20449, 20450];
     const listeners = listListeners([20440, 20460]);
     for (const l of listeners) {
         if (!candidates.includes(l.port)) candidates.push(l.port);
     }
     for (const port of [...new Set(candidates)]) {
-        const r = await probe({ host: '127.0.0.1', port, scheme: 'https', path: '/v1/models', apiKey });
-        if (r.ok) return { port, listener: listeners.find((l) => l.port === port) };
+        // Discovery probe — does the port serve /v1/models with our key?
+        const loose = await probe({ host: '127.0.0.1', port, scheme: 'https',
+            path: '/v1/models', apiKey, strictTls: false });
+        if (!loose.ok) continue;
+        // Cert trust probe — system curl == Excel's view of trust.
+        const verdict = verifyCertViaSystemCurl(`https://127.0.0.1:${port}/v1/models`, apiKey);
+        return {
+            port,
+            listener: listeners.find((l) => l.port === port),
+            certTrusted: verdict.trusted,
+            certError:   verdict.trusted ? null : `http=${verdict.http} ssl_verify=${verdict.sslVerify}`,
+        };
     }
     return null;
 }
@@ -106,7 +135,13 @@ async function scan() {
     return {
         nineRouter: { port: 20128, alive: niner.ok, status: niner.status || niner.error },
         httpsProxy: httpsP
-            ? { port: httpsP.port, listener: httpsP.listener, alive: true }
+            ? {
+                port: httpsP.port,
+                listener: httpsP.listener,
+                alive: true,
+                certTrusted: httpsP.certTrusted,
+                certError: httpsP.certError,
+              }
             : { alive: false, hint: 'No HTTPS proxy reaching 9router. Excel/Office add-ins need HTTPS — start your Caddy/cowork proxy first.' },
         apiKey,
         models: ['cc/claude-sonnet-4-6', 'cc/claude-opus-4-7', 'cc/claude-haiku-4-5-20251001'],
@@ -146,12 +181,29 @@ function printHuman(s) {
         const l = s.httpsProxy.listener;
         const desc = l ? `${l.cmd} pid=${l.pid}` : 'unknown';
         console.log(`  ${c.green('✓')} HTTPS proxy  :${s.httpsProxy.port}  ${c.dim(`(${desc})`)}`);
+        if (s.httpsProxy.certTrusted === false) {
+            console.log(`  ${c.red('✗')} TLS cert      ${c.yellow('NOT trusted by system keychain — Excel will reject')}`);
+            console.log(`     ${c.dim('error: ' + s.httpsProxy.certError)}`);
+            console.log();
+            console.log(c.bold('  Fix: install the proxy\'s root CA into login keychain.'));
+            console.log(c.dim('  If you used 9router\'s rootCA (~/.9router/mitm/rootCA.crt):'));
+            console.log(c.cyan('    security add-trusted-cert -r trustRoot \\'));
+            console.log(c.cyan('      -k ~/Library/Keychains/login.keychain-db \\'));
+            console.log(c.cyan('      ~/.9router/mitm/rootCA.crt'));
+            console.log(c.dim('  Then re-run this command and try Excel again.'));
+        } else if (s.httpsProxy.certTrusted === true) {
+            console.log(`  ${c.green('✓')} TLS cert      ${c.dim('trusted by system keychain')}`);
+        }
     } else {
         console.log(`  ${c.red('✗')} HTTPS proxy   ${c.dim(s.httpsProxy.hint)}`);
     }
     console.log();
 
     const cfg = buildConfigText(s);
+    if (cfg && s.httpsProxy.certTrusted === false) {
+        console.log(c.yellow('⚠ Cert untrusted — Excel will reject the connection. Fix above before pasting.'));
+        console.log();
+    }
     if (cfg) {
         console.log(c.bold('=== Excel paste-ready config ==='));
         console.log();
