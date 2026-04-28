@@ -15,7 +15,7 @@
  * Flags:
  *   --save     Also write config to ~/Desktop/excel-claude-config.txt
  *   --json     Emit machine-readable JSON instead of human output
- *   --inject   Write config directly into Excel's pivot.claude.ai LocalStorage
+ *   --inject   Write config (auto-installs cert into keychain via Touch ID/password) directly into Excel's pivot.claude.ai LocalStorage
  *              (requires Excel to be quit). On next launch the Anthropic
  *              Claude add-in finds the gateway URL + API key pre-filled —
  *              no manual paste.
@@ -251,9 +251,54 @@ function findPivotClaudeLocalStorage() {
 //   value (UTF-16-LE):
 //     {"kind":"gateway","url":"https://127.0.0.1:PORT/v1",
 //      "token":"sk-...","authHeader":"x-api-key","apiFormat":"anthropic"}
+// Install the proxy's root CA into the user's login keychain so Excel/WebKit
+// trust the self-signed cert. Triggers a Touch ID / password GUI prompt the
+// first time. Idempotent: already-trusted certs are silently re-accepted.
+function ensureCertTrusted(s) {
+    if (s.httpsProxy?.certTrusted) return true;
+
+    // Common root CA locations to try, in order of preference.
+    // 9router ships its own MITM rootCA which signs the leaf cert Caddy serves.
+    const candidates = [
+        path.join(HOME, '.9router', 'mitm', 'rootCA.crt'),
+        path.join(HOME, '.9router', 'leaf.crt'),
+        path.join(HOME, '.config', 'cowork-gateway', 'cert.crt'),
+    ];
+    const rootCA = candidates.find((p) => fs.existsSync(p));
+    if (!rootCA) {
+        log(c.yellow('Cannot auto-trust cert: no root CA found at standard paths.'));
+        log(c.dim('  Looked at: ' + candidates.join(', ')));
+        return false;
+    }
+
+    log(c.yellow('Cert not yet trusted by keychain.'));
+    log(c.dim('  Installing: ' + rootCA));
+    log(c.dim('  macOS will prompt for your password or Touch ID once.'));
+
+    const r = spawnSync('/usr/bin/security', [
+        'add-trusted-cert', '-r', 'trustRoot',
+        '-k', path.join(HOME, 'Library/Keychains/login.keychain-db'),
+        rootCA,
+    ], { stdio: 'inherit' });
+
+    if (r.status !== 0) {
+        log(c.red('  Trust install failed (exit ' + r.status + ')'));
+        log(c.dim('  Run manually: security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db ' + rootCA));
+        return false;
+    }
+    log(c.green('  ✓ Cert installed in login keychain'));
+    return true;
+}
+
 function injectIntoExcel(s) {
     if (!s.httpsProxy?.alive) die('HTTPS proxy not detected — nothing to inject');
-    if (!s.httpsProxy.certTrusted) die('Cert not trusted by keychain — Excel would reject anyway');
+
+    // Try to auto-trust cert if needed; without it Excel will reject TLS later.
+    if (!s.httpsProxy.certTrusted) {
+        if (!ensureCertTrusted(s)) {
+            die('Cert still not trusted — aborting inject (Excel would reject anyway).');
+        }
+    }
 
     const lsPath = findPivotClaudeLocalStorage();
     if (!lsPath) die('pivot.claude.ai LocalStorage not found. Open Anthropic Claude add-in in Excel once first to create it.');
