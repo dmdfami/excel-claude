@@ -14,22 +14,36 @@ fighting the three quirks that block this setup out of the box.
 
 ## Install
 
+**One-liner — zero prompts** (when 9router is already running locally):
+
+```bash
+npx github:dmdfami/cowork-gateway init --auto
+```
+
+The CLI reads `~/.9router/db.json`, pulls the API key, verifies the gateway
+is reachable on `:20128`, picks sensible default model aliases, and configures
+everything end-to-end.
+
+**Interactive mode** (no 9router on this machine, or different gateway):
+
 ```bash
 npx github:dmdfami/cowork-gateway init
 ```
 
-You'll be asked for three things:
+Prompts for:
 
-1. **Gateway base URL** — e.g. `http://127.0.0.1:20128/v1` (your 9router)
-2. **API key** — the `sk-...` token from your gateway
+1. **Gateway base URL** — e.g. `http://127.0.0.1:20128/v1`
+2. **API key** — the `sk-...` token
 3. **Model IDs** — comma-separated, e.g. `claude-sonnet-4-6,claude-opus-4-7`
 
-That's it. The wizard will:
+Either way, the tool will:
 
 - Generate a self-signed cert for `127.0.0.1`
 - Trust it in your login keychain
 - Write a launchd plist so the proxy auto-starts at login
 - Print the exact settings to paste into Excel and Claude Desktop
+
+No Caddy, no nginx, no extra services — single Node process, native HTTPS.
 
 ## Use in Excel
 

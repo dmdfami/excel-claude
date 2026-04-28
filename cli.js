@@ -64,26 +64,82 @@ const ask = (question, defaultValue = '') => new Promise((resolve) => {
     });
 });
 
+// ---------- detect ----------
+const DEFAULT_MODELS = ['claude-sonnet-4-6', 'claude-opus-4-7', 'claude-haiku-4-5'];
+
+// Look for an existing 9router install on the local machine and pull its
+// baseUrl + first apiKey straight from db.json. Verifies the gateway is
+// actually reachable before returning. Returns null if nothing usable.
+function detectLocal9router() {
+    const dbPath = path.join(HOME, '.9router', 'db.json');
+    if (!fs.existsSync(dbPath)) return null;
+    let db;
+    try { db = JSON.parse(fs.readFileSync(dbPath, 'utf8')); }
+    catch (_) { return null; }
+    const apiKey = db?.apiKeys?.[0]?.key;
+    if (!apiKey) return null;
+    const baseUrl = 'http://127.0.0.1:20128/v1';
+    const r = sh('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}',
+        '--max-time', '3', `${baseUrl}/models`,
+        '-H', `Authorization: Bearer ${apiKey}`], { allowFail: true });
+    if (r.stdout.trim() !== '200') return null;
+    return { baseUrl, apiKey, source: '~/.9router/db.json' };
+}
+
+function checkPortFree(port) {
+    const r = sh('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN'],
+                 { allowFail: true });
+    if (r.stdout.trim()) {
+        die(`Port ${port} already in use:\n${r.stdout}\nStop the existing service or re-run init with a different port.`);
+    }
+}
+
 // ---------- init ----------
 async function cmdInit() {
-    log('Setting up cowork-gateway. Three quick questions:\n');
-    const baseUrl  = await ask('1. Gateway base URL (your 9router or other Anthropic-compat endpoint):',
-                                'http://127.0.0.1:20128/v1');
-    const apiKey   = await ask('2. API key (sk-...):');
-    const modelStr = await ask('3. Model IDs, comma-separated (Excel only accepts names matching "claude*"):',
-                                'claude-sonnet-4-6,claude-opus-4-7,claude-haiku-4-5');
-    const httpsPort = Number(await ask('4. HTTPS port to listen on locally:', '20443'));
+    const args = process.argv.slice(3);
+    const auto = args.includes('--auto') || args.includes('-y') || args.includes('--yes');
+    const portArg = args.find((a) => a.startsWith('--port='));
+    const portFromArg = portArg ? Number(portArg.split('=')[1]) : null;
+
+    let baseUrl, apiKey, models, httpsPort;
+
+    const detected = detectLocal9router();
+    if (detected) {
+        log(`${c.green('✓')} Detected 9router → ${detected.baseUrl}`);
+        log(`  API key from ${detected.source}`);
+        if (auto) {
+            log(`Running ${c.cyan('--auto')} mode — using detected config, no prompts.`);
+            ({ baseUrl, apiKey } = detected);
+            models = DEFAULT_MODELS;
+            httpsPort = portFromArg || 20443;
+        } else {
+            const confirm = await ask(`Use detected config? ${c.dim('[Y/n]')}`, 'Y');
+            if (confirm.toLowerCase().startsWith('y')) {
+                ({ baseUrl, apiKey } = detected);
+                const modelStr = await ask('Model IDs (comma-sep):',
+                                            DEFAULT_MODELS.join(','));
+                models = modelStr.split(',').map((s) => s.trim()).filter(Boolean);
+                httpsPort = portFromArg || Number(await ask('HTTPS port:', '20443'));
+            }
+        }
+    }
+
+    // Wizard fallback (no detection or user declined)
+    if (!apiKey) {
+        if (auto) die('No 9router detected and --auto specified. Run without --auto for wizard.');
+        log('No local 9router detected, or you declined. Manual setup:\n');
+        baseUrl  = await ask('1. Gateway base URL:', 'http://127.0.0.1:20128/v1');
+        apiKey   = await ask('2. API key (sk-...):');
+        const modelStr = await ask('3. Model IDs (comma-sep):',
+                                    DEFAULT_MODELS.join(','));
+        models = modelStr.split(',').map((s) => s.trim()).filter(Boolean);
+        httpsPort = portFromArg || Number(await ask('4. HTTPS port:', '20443'));
+    }
 
     if (!baseUrl || !apiKey) die('baseUrl and apiKey are required');
+    checkPortFree(httpsPort);
 
-    const config = {
-        baseUrl,
-        apiKey,
-        models: modelStr.split(',').map((s) => s.trim()).filter(Boolean),
-        httpsPort,
-        toolNameUnmangle: true,
-    };
-
+    const config = { baseUrl, apiKey, models, httpsPort, toolNameUnmangle: true };
     fs.mkdirSync(CFG_DIR, { recursive: true });
     fs.writeFileSync(CFG_FILE, JSON.stringify(config, null, 2));
     fs.chmodSync(CFG_FILE, 0o600);
@@ -305,14 +361,19 @@ if (handlers[cmd]) {
     console.log(`cowork-gateway — Anthropic-compatible HTTPS bridge for Excel & Claude Desktop
 
 Commands:
-  init        Interactive setup (asks baseUrl, apiKey, models)
+  init [--auto] [--port=N]
+              Setup. Auto-detects 9router from ~/.9router/db.json.
+              --auto: zero-prompt mode using detected config + defaults.
   start       Load launchd service
   stop        Unload launchd service
   status      Show service + recent log
   uninstall   Remove plist, cert, trust entry
   serve       (internal) Run the HTTPS proxy in foreground
 
-Quick start:
+Quick start (with 9router already running locally):
+  npx github:dmdfami/cowork-gateway init --auto
+
+Manual mode (will prompt for baseUrl + apiKey):
   npx github:dmdfami/cowork-gateway init
 `);
 }
