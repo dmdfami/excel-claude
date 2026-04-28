@@ -1,7 +1,7 @@
 {
   "name": "excel-claude",
-  "version": "0.7.0",
-  "description": "Read-only diagnostic for local Claude/9router gateway setup. Scans listeners + reads ~/.9router/db.json, prints Excel-paste-ready config. Does not install anything.",
+  "version": "0.8.0",
+  "description": "One-shot setup for the Anthropic Claude add-in in Excel against a local 9router gateway. Scans listeners, prints config, trusts cert, and injects gateway URL + API key into Excel's LocalStorage so Claude pre-fills on next launch.",
   "bin": {
     "excel-claude": "./cli.js"
   },

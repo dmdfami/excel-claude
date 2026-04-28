@@ -1,24 +1,25 @@
 #!/usr/bin/env node
 /*
- * excel-claude — read-only diagnostic / config printer.
+ * excel-claude — one-shot setup for Anthropic Claude add-in in Excel.
  *
- * Scans the local machine for:
- *   1. 9router (~/.9router/db.json + listener on :20128)
- *   2. An HTTPS proxy in front of 9router (typically :20443) that
- *      successfully forwards /v1/models with the 9router API key.
+ * Run: npx dmdfami/excel-claude
  *
- * Emits an Excel-paste-ready config block. Does NOT install services,
- * does NOT generate certs, does NOT touch Excel preferences. Pure read.
+ * Default behavior:
+ *   1. Scan 9router (~/.9router/db.json) + local HTTPS proxy
+ *   2. Print Excel-paste-ready config block
+ *   3. Auto-trust the proxy's root CA in the login keychain if not yet
+ *      trusted (one-time Touch ID / password prompt)
+ *   4. Inject config straight into Excel's pivot.claude.ai LocalStorage
+ *      so the Anthropic Claude add-in pre-fills on next launch
  *
- * Run: npx github:dmdfami/excel-claude
+ * If Excel is currently open, step 4 is skipped (LocalStorage is locked) —
+ * the user can either Cmd+Q Excel and re-run, or copy-paste the printed
+ * config manually.
  *
  * Flags:
- *   --save     Also write config to ~/Desktop/excel-claude-config.txt
- *   --json     Emit machine-readable JSON instead of human output
- *   --inject   Write config (auto-installs cert into keychain via Touch ID/password) directly into Excel's pivot.claude.ai LocalStorage
- *              (requires Excel to be quit). On next launch the Anthropic
- *              Claude add-in finds the gateway URL + API key pre-filled —
- *              no manual paste.
+ *   --no-inject / --print-only  Skip step 4
+ *   --save                      Also write config to ~/Desktop/excel-claude-config.txt
+ *   --json                      Machine-readable JSON only (implies --no-inject)
  */
 
 const fs        = require('fs');
@@ -216,8 +217,9 @@ function printHuman(s) {
         console.log();
         console.log(cfg.split('\n').map((l) => '  ' + l).join('\n'));
         console.log();
-        console.log(c.dim('Save to file: excel-claude --save'));
-        console.log(c.dim('Re-run anytime to re-emit if you forget the values.'));
+        console.log(c.dim('Re-run anytime: npx dmdfami/excel-claude'));
+        console.log(c.dim('  --save        also write to ~/Desktop/excel-claude-config.txt'));
+        console.log(c.dim('  --no-inject   skip writing to Excel LocalStorage (just print)'));
     } else {
         console.log(c.yellow('Cannot emit config — HTTPS proxy not reachable.'));
         console.log(c.dim('Set up Caddy or another HTTPS proxy in front of 9router :' + s.nineRouter.port));
@@ -291,23 +293,17 @@ function ensureCertTrusted(s) {
 }
 
 function injectIntoExcel(s) {
-    if (!s.httpsProxy?.alive) die('HTTPS proxy not detected — nothing to inject');
+    if (!s.httpsProxy?.alive) throw new Error('HTTPS proxy not detected');
 
     // Try to auto-trust cert if needed; without it Excel will reject TLS later.
     if (!s.httpsProxy.certTrusted) {
         if (!ensureCertTrusted(s)) {
-            die('Cert still not trusted — aborting inject (Excel would reject anyway).');
+            throw new Error('Cert still not trusted — Excel would reject anyway.');
         }
     }
 
     const lsPath = findPivotClaudeLocalStorage();
-    if (!lsPath) die('pivot.claude.ai LocalStorage not found. Open Anthropic Claude add-in in Excel once first to create it.');
-
-    // Excel must be quit — SQLite WAL is locked otherwise.
-    const pg = spawnSync('pgrep', ['-f', 'Microsoft Excel'], { encoding: 'utf8' });
-    if ((pg.stdout || '').trim()) {
-        die('Excel is currently running. Quit it completely (⌘Q) before --inject (LocalStorage DB is locked).');
-    }
+    if (!lsPath) throw new Error('pivot.claude.ai LocalStorage not found. Open Anthropic Claude in Excel once first.');
 
     const profile = JSON.stringify({
         kind: 'gateway',
@@ -330,7 +326,7 @@ print("ok", flush=True)
 `;
     const pyResult = spawnSync('/usr/bin/python3', ['-c', pyScript], { encoding: 'utf8' });
     if (pyResult.status !== 0 || !(pyResult.stdout || '').includes('ok')) {
-        die(`Inject failed: ${pyResult.stderr || pyResult.stdout}`);
+        throw new Error(`SQLite write failed: ${pyResult.stderr || pyResult.stdout}`);
     }
 
     log(c.green(`✓ Config injected into Excel LocalStorage`));
@@ -340,9 +336,10 @@ print("ok", flush=True)
 
 (async () => {
     const args = process.argv.slice(2);
-    const wantJson = args.includes('--json');
-    const wantSave = args.includes('--save');
-    const wantInject = args.includes('--inject');
+    const wantJson    = args.includes('--json');
+    const wantSave    = args.includes('--save');
+    // Inject is the default — pass --no-inject (or --print-only) to skip.
+    const skipInject  = args.includes('--no-inject') || args.includes('--print-only') || wantJson;
 
     const s = await scan();
 
@@ -360,9 +357,18 @@ print("ok", flush=True)
             console.log(c.green(`\n✓ Saved to ${SAVE_PATH}`));
         }
     }
-    if (wantInject) {
+    if (!skipInject && s.httpsProxy?.alive) {
         console.log();
-        injectIntoExcel(s);
+        // Inject is best-effort: if Excel is open, skip with a friendly nudge
+        // instead of erroring out — user already has the printed config above.
+        const pg = spawnSync('pgrep', ['-f', 'Microsoft Excel'], { encoding: 'utf8' });
+        if ((pg.stdout || '').trim()) {
+            console.log(c.yellow('⚠ Excel is open — skipping auto-inject (LocalStorage is locked).'));
+            console.log(c.dim('  Quit Excel (⌘Q) and re-run this command to inject. Or paste the config above.'));
+        } else {
+            try { injectIntoExcel(s); }
+            catch (e) { console.log(c.yellow('Inject skipped: ' + e.message)); }
+        }
     }
 })().catch((e) => {
     console.error(c.red('Unexpected error: ' + e.message));
