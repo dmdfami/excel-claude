@@ -13,8 +13,12 @@
  * Run: npx github:dmdfami/excel-claude
  *
  * Flags:
- *   --save   Also write config to ~/Desktop/excel-claude-config.txt
- *   --json   Emit machine-readable JSON instead of human output
+ *   --save     Also write config to ~/Desktop/excel-claude-config.txt
+ *   --json     Emit machine-readable JSON instead of human output
+ *   --inject   Write config directly into Excel's pivot.claude.ai LocalStorage
+ *              (requires Excel to be quit). On next launch the Anthropic
+ *              Claude add-in finds the gateway URL + API key pre-filled —
+ *              no manual paste.
  */
 
 const fs        = require('fs');
@@ -36,6 +40,9 @@ const c = {
     dim:    (s) => `\x1b[2m${s}\x1b[0m`,
     bold:   (s) => `\x1b[1m${s}\x1b[0m`,
 };
+
+const log = (...a) => console.log(c.cyan('[excel-claude]'), ...a);
+const die = (m) => { console.error(c.red('[excel-claude] ERROR:'), m); process.exit(1); };
 
 function probe({ host, port, scheme, path: p, apiKey, timeout = 3000, strictTls = false }) {
     return new Promise((resolve) => {
@@ -218,10 +225,79 @@ function printHuman(s) {
     }
 }
 
+// Find pivot.claude.ai LocalStorage SQLite path by scanning WebKit origin folders.
+function findPivotClaudeLocalStorage() {
+    const ROOT = path.join(HOME, 'Library/Containers/com.microsoft.Excel/Data/Library/WebKit/WebsiteData/Default');
+    if (!fs.existsSync(ROOT)) return null;
+    for (const d of fs.readdirSync(ROOT)) {
+        const inner = path.join(ROOT, d, d);
+        const originFile = path.join(inner, 'origin');
+        if (!fs.existsSync(originFile)) continue;
+        const origin = fs.readFileSync(originFile, 'utf8');
+        if (origin.includes('pivot.claude.ai')) {
+            const ls = path.join(inner, 'LocalStorage', 'localstorage.sqlite3');
+            if (fs.existsSync(ls)) return ls;
+        }
+    }
+    return null;
+}
+
+// Write Claude inference profile directly into Excel's LocalStorage so
+// Anthropic's add-in finds it pre-filled on next launch. Reverse-engineered
+// from the live storage shape:
+//
+//   key: claude.inference.profile
+//   key: _OfficeRuntime_Storage_claude.inference.profile (Office runtime mirror)
+//   value (UTF-16-LE):
+//     {"kind":"gateway","url":"https://127.0.0.1:PORT/v1",
+//      "token":"sk-...","authHeader":"x-api-key","apiFormat":"anthropic"}
+function injectIntoExcel(s) {
+    if (!s.httpsProxy?.alive) die('HTTPS proxy not detected — nothing to inject');
+    if (!s.httpsProxy.certTrusted) die('Cert not trusted by keychain — Excel would reject anyway');
+
+    const lsPath = findPivotClaudeLocalStorage();
+    if (!lsPath) die('pivot.claude.ai LocalStorage not found. Open Anthropic Claude add-in in Excel once first to create it.');
+
+    // Excel must be quit — SQLite WAL is locked otherwise.
+    const pg = spawnSync('pgrep', ['-f', 'Microsoft Excel'], { encoding: 'utf8' });
+    if ((pg.stdout || '').trim()) {
+        die('Excel is currently running. Quit it completely (⌘Q) before --inject (LocalStorage DB is locked).');
+    }
+
+    const profile = JSON.stringify({
+        kind: 'gateway',
+        url: `https://127.0.0.1:${s.httpsProxy.port}/v1`,
+        token: s.apiKey,
+        authHeader: 'x-api-key',
+        apiFormat: 'anthropic',
+    });
+    const profileB64 = Buffer.from(profile, 'utf8').toString('base64');
+
+    // Use python3 (preinstalled on macOS) — Node has no built-in sqlite3.
+    const pyScript = `
+import sqlite3, base64, sys
+v = base64.b64decode("${profileB64}").decode('utf-8').encode('utf-16-le')
+con = sqlite3.connect(${JSON.stringify(lsPath)})
+for k in ("claude.inference.profile", "_OfficeRuntime_Storage_claude.inference.profile"):
+    con.execute("INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)", (k, sqlite3.Binary(v)))
+con.commit()
+print("ok", flush=True)
+`;
+    const pyResult = spawnSync('/usr/bin/python3', ['-c', pyScript], { encoding: 'utf8' });
+    if (pyResult.status !== 0 || !(pyResult.stdout || '').includes('ok')) {
+        die(`Inject failed: ${pyResult.stderr || pyResult.stdout}`);
+    }
+
+    log(c.green(`✓ Config injected into Excel LocalStorage`));
+    log(c.dim(`  ${lsPath}`));
+    log(c.dim('  Open Excel → Anthropic Claude — gateway URL + token will be pre-filled.'));
+}
+
 (async () => {
     const args = process.argv.slice(2);
     const wantJson = args.includes('--json');
     const wantSave = args.includes('--save');
+    const wantInject = args.includes('--inject');
 
     const s = await scan();
 
@@ -238,6 +314,10 @@ function printHuman(s) {
             fs.writeFileSync(SAVE_PATH, cfg);
             console.log(c.green(`\n✓ Saved to ${SAVE_PATH}`));
         }
+    }
+    if (wantInject) {
+        console.log();
+        injectIntoExcel(s);
     }
 })().catch((e) => {
     console.error(c.red('Unexpected error: ' + e.message));
