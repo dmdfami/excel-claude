@@ -1,6 +1,6 @@
 {
   "name": "excel-claude",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Read-only diagnostic for local Claude/9router gateway setup. Scans listeners + reads ~/.9router/db.json, prints Excel-paste-ready config. Does not install anything.",
   "bin": {
     "excel-claude": "./cli.js"
