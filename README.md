@@ -1,4 +1,4 @@
-# cowork-gateway
+# excel-claude
 
 Tiny **read-only diagnostic** that prints the right Excel / Claude
 Desktop config for talking to your local **9router** through whatever
@@ -10,7 +10,7 @@ Replaces the manual "what port is the proxy on this time, what's my
 ## Usage
 
 ```bash
-npx github:dmdfami/cowork-gateway
+npx dmdfami/excel-claude
 ```
 
 Output:
@@ -35,7 +35,7 @@ Output:
 ## Save to file
 
 ```bash
-npx github:dmdfami/cowork-gateway --save
+npx dmdfami/excel-claude --save
 ```
 
 Writes the config block to `~/Desktop/excel-claude-config.txt` so you
@@ -44,7 +44,7 @@ can copy-paste it into Excel later without remembering port numbers.
 ## JSON mode (for scripts)
 
 ```bash
-npx github:dmdfami/cowork-gateway --json
+npx dmdfami/excel-claude --json
 ```
 
 Returns `{nineRouter, httpsProxy, apiKey, models}` for programmatic use.

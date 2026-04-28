@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /*
- * cowork-gateway — read-only diagnostic / config printer.
+ * excel-claude — read-only diagnostic / config printer.
  *
  * Scans the local machine for:
  *   1. 9router (~/.9router/db.json + listener on :20128)
@@ -10,7 +10,7 @@
  * Emits an Excel-paste-ready config block. Does NOT install services,
  * does NOT generate certs, does NOT touch Excel preferences. Pure read.
  *
- * Run: npx github:dmdfami/cowork-gateway
+ * Run: npx github:dmdfami/excel-claude
  *
  * Flags:
  *   --save   Also write config to ~/Desktop/excel-claude-config.txt
@@ -209,7 +209,7 @@ function printHuman(s) {
         console.log();
         console.log(cfg.split('\n').map((l) => '  ' + l).join('\n'));
         console.log();
-        console.log(c.dim('Save to file: cowork-gateway --save'));
+        console.log(c.dim('Save to file: excel-claude --save'));
         console.log(c.dim('Re-run anytime to re-emit if you forget the values.'));
     } else {
         console.log(c.yellow('Cannot emit config — HTTPS proxy not reachable.'));
